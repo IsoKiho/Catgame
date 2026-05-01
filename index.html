@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+
 <html lang="fi">
 <head>
 <meta charset="UTF-8">
@@ -6,6 +7,7 @@
 <title>Kissapeli 🐾</title>
 
 <!-- Käynnistää ilman selaimen palkkeja kun lisätään aloitusnäyttöön -->
+
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -27,27 +29,34 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   }
 
-  #start-screen {
+  #start-screen, #end-screen {
     position: fixed; inset: 0; z-index: 100;
     display: flex; flex-direction: column;
     align-items: center; justify-content: center; gap: 28px;
     background: rgba(0, 0, 0, 0.55);
     backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);
-    padding-top: env(safe-area-inset-top);
-    padding-bottom: env(safe-area-inset-bottom);
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
   }
-  #start-screen h1 {
+  #end-screen { display: none; }
+  #start-screen h1, #end-screen h1 {
     color: white; font-size: clamp(36px, 9vw, 72px);
     font-weight: 800; letter-spacing: -0.02em;
     text-shadow: 0 4px 20px rgba(0,0,0,0.4);
+    text-align: center;
   }
-  #start-screen p {
+  #start-screen p, #end-screen p {
     color: rgba(255,255,255,0.85);
     font-size: clamp(16px, 4vw, 22px);
     text-align: center; padding: 0 24px;
   }
-  #start-btn {
+  #end-score {
+    color: #ffd166; font-size: clamp(48px, 14vw, 96px);
+    font-weight: 900; letter-spacing: -0.03em;
+    text-shadow: 0 4px 24px rgba(0,0,0,0.5);
+    font-variant-numeric: tabular-nums;
+  }
+  #start-btn, #again-btn {
     padding: 22px 56px; font-size: clamp(24px, 6vw, 32px);
     border: none; border-radius: 999px;
     background: linear-gradient(135deg, #ffd166, #ef476f);
@@ -55,7 +64,7 @@
     box-shadow: 0 12px 40px rgba(0,0,0,0.35), inset 0 -4px 0 rgba(0,0,0,0.15);
     transition: transform 0.15s ease;
   }
-  #start-btn:active { transform: scale(0.94); }
+  #start-btn:active, #again-btn:active { transform: scale(0.94); }
 
   #game { position: fixed; inset: 0; }
 
@@ -115,13 +124,21 @@
     100% { transform: translate(-50%, -150%) scale(2) rotate(45deg); opacity: 0; }
   }
 </style>
+
 </head>
 <body>
 
 <div id="start-screen">
   <h1>🐾 Kissapeli 🐾</h1>
-  <p>Anna kissan tassutella palloja!</p>
+  <p>Anna kissan tassutella palloja!<br>Sessio kestää noin 8 minuuttia.</p>
   <button id="start-btn">Aloita</button>
+</div>
+
+<div id="end-screen">
+  <h1>Hyvä saalistus! 🐾</h1>
+  <p>Saalista yhteensä</p>
+  <div id="end-score">0</div>
+  <button id="again-btn">Pelaa uudestaan</button>
 </div>
 
 <div id="game"></div>
@@ -129,16 +146,32 @@
 <button id="exit" aria-label="Sulje">✕</button>
 
 <script>
-  const game = document.getElementById('game');
-  const scoreEl = document.getElementById('score');
+  // ============================================================
+  //  Kissapeli — saalistuspeli kissalle
+  //  Liikemalli perustuu kissan luontaiseen saalistus-sekvenssiin:
+  //    stalk (pysähtyy ja vaanii) → creep (hidas hiipiminen)
+  //    → dash (nopea purske) → wander (rauhallinen liike)
+  //  Pallon koot vaihtelevat (myös pieni hiiren kokoinen).
+  //  Äänet: rapinaa (suodatettu kohina) + saaliin vingahdus.
+  // ============================================================
+
+  const game        = document.getElementById('game');
+  const scoreEl     = document.getElementById('score');
   const startScreen = document.getElementById('start-screen');
-  const startBtn = document.getElementById('start-btn');
-  const exitBtn = document.getElementById('exit');
+  const endScreen   = document.getElementById('end-screen');
+  const endScoreEl  = document.getElementById('end-score');
+  const startBtn    = document.getElementById('start-btn');
+  const againBtn    = document.getElementById('again-btn');
+  const exitBtn     = document.getElementById('exit');
+
+  const SESSION_MS = 8 * 60 * 1000;  // 8 min sessio (suositus 5-10 min)
 
   let score = 0;
   let currentBall = null;
   let audioCtx = null;
+  let noiseBuffer = null;
   let running = false;
+  let sessionTimer = null;
 
   const colors = [
     ['#ff6b6b', '#c92a2a'], ['#ffd166', '#f08c00'], ['#06d6a0', '#0b7a51'],
@@ -152,99 +185,156 @@
     '#1982c4', '#386641', '#bc4749', '#003049', '#5a189a', '#0f4c5c'
   ];
 
+  // ----- Audio -----
+
   function initAudio() {
     if (!audioCtx) {
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      // Esiluodaan kohinapuskuri rapinoita varten
+      const len = audioCtx.sampleRate * 1.0;
+      noiseBuffer = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+      const data = noiseBuffer.getChannelData(0);
+      for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
     }
     if (audioCtx.state === 'suspended') audioCtx.resume();
   }
 
-  function playRandomSound() {
+  // Rapina — suodatettu kohina granulaarisella kuoren muotoilulla.
+  // Kuulostaa kuivilta lehdiltä tai pieneltä eläimeltä joka rapistelee.
+  function rustle(volume = 0.18, durMs = 220) {
     if (!audioCtx) return;
-    const sounds = [boop, chirp, popSound, meow, twinkle];
-    sounds[Math.floor(Math.random() * sounds.length)]();
-  }
-
-  function boop() {
     const t = audioCtx.currentTime;
-    const o = audioCtx.createOscillator();
-    const g = audioCtx.createGain();
-    o.type = 'sine';
-    o.frequency.setValueAtTime(900, t);
-    o.frequency.exponentialRampToValueAtTime(220, t + 0.18);
-    g.gain.setValueAtTime(0.35, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
-    o.connect(g); g.connect(audioCtx.destination);
-    o.start(t); o.stop(t + 0.22);
+    const dur = durMs / 1000;
+
+    const src = audioCtx.createBufferSource();
+    src.buffer = noiseBuffer;
+    src.loop = true;
+
+    // Bandpass korkealla (kuiva, terävä rapina ~3-7 kHz)
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = 3000 + Math.random() * 3500;
+    filter.Q.value = 1.2;
+
+    // Granulaarinen amplitudikäyrä — pieniä piikkejä peräkkäin
+    const gain = audioCtx.createGain();
+    gain.gain.setValueAtTime(0, t);
+    const grains = 5 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < grains; i++) {
+      const tt = t + (i / grains) * dur;
+      const peak = volume * (0.4 + Math.random() * 0.6);
+      gain.gain.linearRampToValueAtTime(peak, tt + 0.005);
+      gain.gain.linearRampToValueAtTime(volume * 0.1, tt + dur / grains * 0.7);
+    }
+    gain.gain.linearRampToValueAtTime(0, t + dur);
+
+    src.connect(filter); filter.connect(gain); gain.connect(audioCtx.destination);
+    src.start(t); src.stop(t + dur + 0.05);
   }
 
-  function chirp() {
+  // Saaliin vingahdus — pieni "squeak" osumaan
+  function squeak() {
+    if (!audioCtx) return;
     const t = audioCtx.currentTime;
     const o = audioCtx.createOscillator();
     const g = audioCtx.createGain();
     o.type = 'triangle';
-    o.frequency.setValueAtTime(450, t);
-    o.frequency.exponentialRampToValueAtTime(1400, t + 0.12);
-    g.gain.setValueAtTime(0.28, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + 0.16);
-    o.connect(g); g.connect(audioCtx.destination);
-    o.start(t); o.stop(t + 0.16);
-  }
-
-  function popSound() {
-    const t = audioCtx.currentTime;
-    const o = audioCtx.createOscillator();
-    const g = audioCtx.createGain();
-    o.type = 'square';
-    o.frequency.setValueAtTime(700, t);
-    o.frequency.exponentialRampToValueAtTime(90, t + 0.09);
-    g.gain.setValueAtTime(0.22, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + 0.11);
-    o.connect(g); g.connect(audioCtx.destination);
-    o.start(t); o.stop(t + 0.11);
-  }
-
-  function meow() {
-    const t = audioCtx.currentTime;
-    const o = audioCtx.createOscillator();
-    const g = audioCtx.createGain();
-    const f = audioCtx.createBiquadFilter();
-    o.type = 'sawtooth';
-    o.frequency.setValueAtTime(450, t);
-    o.frequency.linearRampToValueAtTime(820, t + 0.12);
-    o.frequency.linearRampToValueAtTime(380, t + 0.35);
-    f.type = 'lowpass';
-    f.frequency.setValueAtTime(1800, t);
-    f.Q.value = 6;
+    o.frequency.setValueAtTime(1400, t);
+    o.frequency.exponentialRampToValueAtTime(2400, t + 0.04);
+    o.frequency.exponentialRampToValueAtTime(900, t + 0.14);
     g.gain.setValueAtTime(0.001, t);
-    g.gain.linearRampToValueAtTime(0.22, t + 0.05);
-    g.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
-    o.connect(f); f.connect(g); g.connect(audioCtx.destination);
-    o.start(t); o.stop(t + 0.4);
+    g.gain.linearRampToValueAtTime(0.18, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(t); o.stop(t + 0.2);
   }
 
-  function twinkle() {
+  // Sirkutus — kuin lintu / hyönteinen
+  function chirp() {
+    if (!audioCtx) return;
     const t = audioCtx.currentTime;
-    [0, 0.08, 0.16].forEach((delay, i) => {
+    [0, 0.07].forEach(d => {
       const o = audioCtx.createOscillator();
       const g = audioCtx.createGain();
       o.type = 'sine';
-      const freqs = [800, 1200, 1600];
-      o.frequency.setValueAtTime(freqs[i], t + delay);
-      g.gain.setValueAtTime(0.001, t + delay);
-      g.gain.linearRampToValueAtTime(0.18, t + delay + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.001, t + delay + 0.18);
+      o.frequency.setValueAtTime(2200, t + d);
+      o.frequency.exponentialRampToValueAtTime(3200, t + d + 0.05);
+      g.gain.setValueAtTime(0.001, t + d);
+      g.gain.linearRampToValueAtTime(0.14, t + d + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.001, t + d + 0.07);
       o.connect(g); g.connect(audioCtx.destination);
-      o.start(t + delay); o.stop(t + delay + 0.2);
+      o.start(t + d); o.stop(t + d + 0.08);
     });
+  }
+
+  // Osumaääni — voimakas rapina + saaliin vingahdus
+  function captureSound() {
+    rustle(0.28, 180);
+    setTimeout(squeak, 40);
+  }
+
+  // Liikkeen rapina — hiljaisempi, satunnainen
+  function moveRustle() {
+    if (Math.random() < 0.7) {
+      rustle(0.06 + Math.random() * 0.05, 100 + Math.random() * 80);
+    } else {
+      if (Math.random() < 0.4) chirp();
+    }
+  }
+
+  // ----- Pelilogiikka -----
+
+  // Tilakone saalistusliikkeelle. Kukin tila kestää oman aikansa.
+  //   stalk = paikallaan, vaanii — kissalle aikaa lähestyä
+  //   creep = hidas, melkein huomaamaton liike
+  //   dash  = nopea purske kuin pakeneva hiiri
+  //   wander = rauhallinen perustila
+  function pickNextState(prev) {
+    const r = Math.random();
+    if (prev === 'dash')  return r < 0.55 ? 'stalk' : (r < 0.8 ? 'creep' : 'wander');
+    if (prev === 'stalk') return r < 0.45 ? 'dash'  : (r < 0.75 ? 'creep' : 'wander');
+    if (prev === 'creep') return r < 0.5  ? 'dash'  : (r < 0.8 ? 'stalk' : 'wander');
+    return r < 0.3 ? 'stalk' : (r < 0.55 ? 'creep' : (r < 0.85 ? 'dash' : 'wander'));
+  }
+
+  function configureState(b, state) {
+    b.state = state;
+    b.stateStart = performance.now();
+    const angle = Math.random() * Math.PI * 2;
+
+    if (state === 'stalk') {
+      b.targetSpeed = 0;
+      b.stateDur = 800 + Math.random() * 1700;     // 0.8 - 2.5 s pysähdys
+      b.jitter = true;                              // pieni huojunta paikallaan
+    } else if (state === 'creep') {
+      b.targetSpeed = 0.3 + Math.random() * 0.7;   // hyvin hidas
+      b.stateDur = 1000 + Math.random() * 1500;
+      b.dirX = Math.cos(angle); b.dirY = Math.sin(angle);
+      b.jitter = false;
+    } else if (state === 'dash') {
+      b.targetSpeed = 5 + Math.random() * 5;       // nopea purske
+      b.stateDur = 400 + Math.random() * 900;
+      b.dirX = Math.cos(angle); b.dirY = Math.sin(angle);
+      b.jitter = false;
+      moveRustle();                                 // dash alkaa rapinalla
+    } else { // wander
+      b.targetSpeed = 1.5 + Math.random() * 2;
+      b.stateDur = 1200 + Math.random() * 1800;
+      b.dirX = Math.cos(angle); b.dirY = Math.sin(angle);
+      b.jitter = false;
+    }
   }
 
   function spawnBall() {
     if (!running || currentBall) return;
 
-    const minSize = Math.min(window.innerWidth, window.innerHeight) * 0.18;
-    const maxSize = Math.min(window.innerWidth, window.innerHeight) * 0.32;
-    const size = minSize + Math.random() * (maxSize - minSize);
+    const minDim = Math.min(window.innerWidth, window.innerHeight);
+    // Koon vaihtelu: 30% pieni (hiiren kokoinen), 50% keski, 20% iso
+    const r = Math.random();
+    let size;
+    if (r < 0.3)      size = minDim * (0.08 + Math.random() * 0.05);  // pieni
+    else if (r < 0.8) size = minDim * (0.15 + Math.random() * 0.08);  // keski
+    else              size = minDim * (0.24 + Math.random() * 0.07);  // iso
 
     const ball = document.createElement('div');
     ball.className = 'ball';
@@ -254,20 +344,26 @@
     const [c1, c2] = colors[Math.floor(Math.random() * colors.length)];
     ball.style.background = `radial-gradient(circle at 32% 28%, ${c1}, ${c2} 75%)`;
 
-    const W = window.innerWidth;
-    const H = window.innerHeight;
-
-    let x = Math.random() * (W - size);
-    let y = Math.random() * (H - size);
-
-    const speed = 1 + Math.random() * 7;
-    const angle = Math.random() * Math.PI * 2;
-    let vx = Math.cos(angle) * speed;
-    let vy = Math.sin(angle) * speed;
+    const W = window.innerWidth, H = window.innerHeight;
+    const x = Math.random() * (W - size);
+    const y = Math.random() * (H - size);
 
     ball.style.transform = `translate(${x}px, ${y}px)`;
     game.appendChild(ball);
-    currentBall = { el: ball, x, y, vx, vy, size, alive: true };
+
+    currentBall = {
+      el: ball, x, y, size,
+      vx: 0, vy: 0,
+      dirX: 1, dirY: 0,
+      targetSpeed: 0,
+      state: null, stateStart: 0, stateDur: 0, jitter: false,
+      lastRustle: 0,
+      alive: true
+    };
+    configureState(currentBall, pickNextState(null));
+
+    // Spawnauksessa hiljainen rapina — kuin saalis ilmestyisi rapisten
+    rustle(0.08, 140);
 
     const hit = (e) => {
       if (!currentBall || !currentBall.alive) return;
@@ -293,7 +389,7 @@
       while (next === document.body.style.backgroundColor);
       document.body.style.background = next;
 
-      playRandomSound();
+      captureSound();
 
       ball.style.setProperty('--bx', currentBall.x + 'px');
       ball.style.setProperty('--by', currentBall.y + 'px');
@@ -303,7 +399,8 @@
       setTimeout(() => {
         ball.remove();
         currentBall = null;
-        setTimeout(spawnBall, 250 + Math.random() * 500);
+        // Saaliin jälkeen pieni tauko (kissa "syö") — 0.5-1.2 s
+        setTimeout(spawnBall, 500 + Math.random() * 700);
       }, 350);
     };
 
@@ -313,16 +410,49 @@
   function tick() {
     if (running && currentBall && currentBall.alive) {
       const b = currentBall;
-      b.x += b.vx; b.y += b.vy;
+      const now = performance.now();
+
+      // Vaihda tilaa kun kesto täyttyy
+      if (now - b.stateStart > b.stateDur) {
+        configureState(b, pickNextState(b.state));
+      }
+
+      // Liikkeen rapina satunnaisesti dash/creep-tiloissa
+      if (b.state === 'dash' && now - b.lastRustle > 250 + Math.random() * 400) {
+        b.lastRustle = now;
+        if (Math.random() < 0.5) moveRustle();
+      } else if (b.state === 'creep' && now - b.lastRustle > 800 + Math.random() * 1200) {
+        b.lastRustle = now;
+        if (Math.random() < 0.3) moveRustle();
+      }
+
+      // Pehmeä kiihdytys kohti tavoitenopeutta
+      const ax = b.dirX * b.targetSpeed - b.vx;
+      const ay = b.dirY * b.targetSpeed - b.vy;
+      b.vx += ax * 0.12;
+      b.vy += ay * 0.12;
+
+      // Stalk-tilassa pieni huojunta paikallaan
+      if (b.jitter) {
+        b.vx = (Math.random() - 0.5) * 0.6;
+        b.vy = (Math.random() - 0.5) * 0.6;
+      }
+
+      b.x += b.vx;
+      b.y += b.vy;
+
       const W = window.innerWidth, H = window.innerHeight;
-      if (b.x < 0)            { b.x = 0;            b.vx = Math.abs(b.vx); }
-      if (b.x > W - b.size)   { b.x = W - b.size;   b.vx = -Math.abs(b.vx); }
-      if (b.y < 0)            { b.y = 0;            b.vy = Math.abs(b.vy); }
-      if (b.y > H - b.size)   { b.y = H - b.size;   b.vy = -Math.abs(b.vy); }
+      if (b.x < 0)            { b.x = 0;          b.vx = Math.abs(b.vx);  b.dirX = Math.abs(b.dirX); }
+      if (b.x > W - b.size)   { b.x = W - b.size; b.vx = -Math.abs(b.vx); b.dirX = -Math.abs(b.dirX); }
+      if (b.y < 0)            { b.y = 0;          b.vy = Math.abs(b.vy);  b.dirY = Math.abs(b.dirY); }
+      if (b.y > H - b.size)   { b.y = H - b.size; b.vy = -Math.abs(b.vy); b.dirY = -Math.abs(b.dirY); }
+
       b.el.style.transform = `translate(${b.x}px, ${b.y}px)`;
     }
     requestAnimationFrame(tick);
   }
+
+  // ----- Sessionhallinta -----
 
   async function startGame() {
     initAudio();
@@ -331,26 +461,41 @@
     try {
       if (el.requestFullscreen) await el.requestFullscreen();
       else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
-    } catch (err) { /* fullscreen not allowed; continue */ }
+    } catch (err) { /* fullscreen ei sallittu, jatketaan silti */ }
 
     startScreen.style.display = 'none';
+    endScreen.style.display = 'none';
     running = true;
     score = 0;
     scoreEl.textContent = '0';
+
+    if (sessionTimer) clearTimeout(sessionTimer);
+    sessionTimer = setTimeout(endSession, SESSION_MS);
+
     spawnBall();
+  }
+
+  function endSession() {
+    running = false;
+    if (currentBall) { currentBall.el.remove(); currentBall = null; }
+    endScoreEl.textContent = score;
+    endScreen.style.display = 'flex';
   }
 
   function exitGame() {
     running = false;
+    if (sessionTimer) { clearTimeout(sessionTimer); sessionTimer = null; }
     if (currentBall) { currentBall.el.remove(); currentBall = null; }
     if (document.fullscreenElement || document.webkitFullscreenElement) {
       if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
       else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
     }
+    endScreen.style.display = 'none';
     startScreen.style.display = 'flex';
   }
 
   startBtn.addEventListener('click', startGame);
+  againBtn.addEventListener('click', startGame);
   exitBtn.addEventListener('click', exitGame);
 
   document.addEventListener('gesturestart', e => e.preventDefault());
@@ -358,5 +503,6 @@
 
   tick();
 </script>
+
 </body>
-</htm
+</html>
